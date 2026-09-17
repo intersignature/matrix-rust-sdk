@@ -70,9 +70,9 @@ enum SwiftCommand {
         #[clap(long)]
         watchos_deployment_target: Option<String>,
 
-        /// Build the targets one by one instead of passing all of them
-        /// to cargo in one go, which makes it hang on lesser devices like plain
-        /// Apple Silicon M1s
+        /// Build the targets one by one instead of passing all of them to cargo
+        /// in one go, which makes it hang on lesser devices like plain Apple
+        /// Silicon M1s
         #[clap(long)]
         sequentially: bool,
     },
@@ -97,7 +97,8 @@ impl SwiftArgs {
                 sequentially,
             } => {
                 // The dev profile seems to cause crashes on some platforms so
-                // we default to reldbg (https://github.com/matrix-org/matrix-rust-sdk/issues/4009)
+                // we default to reldbg
+                // (https://github.com/matrix-org/matrix-rust-sdk/issues/4009)
                 let profile =
                     profile.as_deref().unwrap_or(if release { "small-release" } else { "reldbg" });
                 build_xcframework(

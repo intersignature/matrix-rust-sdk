@@ -111,9 +111,8 @@ pub(crate) enum AggregationKind {
     /// This is the marker of the end of a poll.
     PollEnd {
         /// Timestamp at which the poll ends, i.e. all the responses with a
-        /// timestamp prior to this one should be taken into account
-        /// (and all the responses with a timestamp after this one
-        /// should be dropped).
+        /// timestamp prior to this one should be taken into account (and all
+        /// the responses with a timestamp after this one should be dropped).
         end_date: MilliSecondsSinceUnixEpoch,
     },
 
@@ -136,7 +135,7 @@ pub(crate) enum AggregationKind {
     /// An event has been edited.
     ///
     /// Note that edits can't be applied in isolation; we need to identify what
-    /// the *latest* edit is, based on the event ordering. As such, they're
+    /// the _latest_ edit is, based on the event ordering. As such, they're
     /// handled exceptionally in `Aggregation::apply` and
     /// `Aggregation::unapply`, and the callers have the responsibility of
     /// considering all the edits and applying only the right one.
@@ -194,8 +193,8 @@ pub(crate) struct Aggregation {
     /// The own timeline identifier for an aggregation.
     ///
     /// It will be a transaction id when the aggregation is still a local echo,
-    /// and it will transition into an event id when the aggregation is a
-    /// remote echo (i.e. has been received in a sync response):
+    /// and it will transition into an event id when the aggregation is a remote
+    /// echo (i.e. has been received in a sync response):
     pub own_id: TimelineEventItemId,
 
     /// `None` when the aggregation came from the server; `Some` for one of our
@@ -495,8 +494,8 @@ impl Aggregation {
         }
     }
 
-    /// Reflect this aggregation's send state on the item it applies to,
-    /// without reapplying its content. Returns whether the item changed.
+    /// Reflect this aggregation's send state on the item it applies to, without
+    /// reapplying its content. Returns whether the item changed.
     fn apply_send_state(
         &self,
         siblings: &[Aggregation],
@@ -551,8 +550,8 @@ pub(crate) struct Aggregations {
     ///
     /// Keyed by the sender's user ID. When a live start item is eventually
     /// inserted via `add_item`, we check if the pending stop matches and
-    /// promote it into [`Self::related_events`] so that [`Self::apply_all`]
-    /// can apply it immediately.
+    /// promote it into [`Self::related_events`] so that [`Self::apply_all`] can
+    /// apply it immediately.
     pending_beacon_stops: HashMap<OwnedUserId, Aggregation>,
 }
 
@@ -641,10 +640,9 @@ impl Aggregations {
         // 3. The remote echo received via sync.
         //
         // The transition from states 1 to 2 is handled in
-        // `update_send_state()`. So here we need to handle the
-        // transition from states 2 to 3. We need to replace the local
-        // echo by the remote echo, which might have more data, like the
-        // raw JSON.
+        // `update_send_state()`. So here we need to handle the transition from
+        // states 2 to 3. We need to replace the local echo by the remote echo,
+        // which might have more data, like the raw JSON.
         let related_events = self.related_events.entry(related_to).or_default();
         if let Some(pos) = related_events.iter().position(|agg| agg.own_id == aggregation.own_id) {
             related_events.remove(pos);
@@ -657,9 +655,9 @@ impl Aggregations {
     /// If so, unapplies it by replacing the corresponding related item, if
     /// needs be.
     ///
-    /// Returns true if an aggregation was found. This doesn't mean
-    /// the underlying item has been updated, if it was missing from the
-    /// timeline for instance.
+    /// Returns true if an aggregation was found. This doesn't mean the
+    /// underlying item has been updated, if it was missing from the timeline
+    /// for instance.
     ///
     /// May return an error if it found an aggregation, but it couldn't be
     /// properly applied.
@@ -717,9 +715,8 @@ impl Aggregations {
                         .related_events
                         .get(found)
                         .is_some_and(|aggregations| resolve_edits(aggregations, items, &mut cowed));
-                    // Otherwise nothing is pending anymore.
-                    // TODO likely need to change the item to indicate
-                    // it's been un-edited etc.
+                    // Otherwise nothing is pending anymore. TODO likely need to
+                    // change the item to indicate it's been un-edited etc.
                     if !resolved {
                         if cowed.edit_send_state.is_none() {
                             return Ok(true);
@@ -930,8 +927,8 @@ fn resolve_edits(
     event: &mut Cow<'_, EventTimelineItem>,
 ) -> bool {
     // A tuple of the best edit, if we have found one and a boolean indicating
-    // if the edit is coming from a local echo. If it's from a local echo,
-    // we can't validate it as we don't have a raw JSON, but this isn't that
+    // if the edit is coming from a local echo. If it's from a local echo, we
+    // can't validate it as we don't have a raw JSON, but this isn't that
     // important as we're sure we won't send ourselves invalid edits.
     let mut best_edit: Option<(PendingEdit, bool)> = None;
     let mut best_edit_pos = None;
@@ -956,16 +953,16 @@ fn resolve_edits(
                 TimelineEventItemId::EventId(event_id) => {
                     if let Some(best_edit_pos) = &mut best_edit_pos {
                         // Find the position of the timeline owning the edit:
-                        // either the bundled item owner
-                        // if this was a bundled edit, or the edit event itself.
+                        // either the bundled item owner if this was a bundled
+                        // edit, or the edit event itself.
                         let pos = items.position_by_event_id(
                             pending_edit.bundled_item_owner.as_ref().unwrap_or(event_id),
                         );
 
                         if let Some(pos) = pos {
                             // If the edit is more recent (higher index) than
-                            // the previous best
-                            // edit we knew about, use this one.
+                            // the previous best edit we knew about, use this
+                            // one.
                             if pos > *best_edit_pos {
                                 best_edit = Some((pending_edit.clone(), false));
                                 *best_edit_pos = pos;
@@ -975,10 +972,8 @@ fn resolve_edits(
                             trace!(edit_id = ?a.own_id, "couldn't find timeline meta for edit event");
 
                             // The edit event isn't in the timeline, so it might
-                            // be a bundled edit. In
-                            // this case, record it as the best edit if and only
-                            // if there wasn't any
-                            // other.
+                            // be a bundled edit. In this case, record it as the
+                            // best edit if and only if there wasn't any other.
                             if best_edit.is_none() {
                                 best_edit = Some((pending_edit.clone(), false));
                                 trace!(?best_edit_pos, edit_id = ?a.own_id, "found bundled edit");
@@ -1122,8 +1117,8 @@ fn same_send_state_kind(a: Option<&EventSendState>, b: Option<&EventSendState>) 
     }
 }
 
-/// The send state to expose for an item's edits: a failed edit blocks the
-/// later ones, so it wins over pending, which wins over sent.
+/// The send state to expose for an item's edits: a failed edit blocks the later
+/// ones, so it wins over pending, which wins over sent.
 fn edit_send_state(aggregations: &[Aggregation]) -> Option<EventSendState> {
     let rank = |s: &EventSendState| match s {
         EventSendState::SendingFailed { .. } => 2,

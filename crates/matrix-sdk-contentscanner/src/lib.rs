@@ -230,8 +230,7 @@ impl MediaFetcher for ContentScannerMediaFetcher {
                             AttachmentDecryptor::new(&mut cursor, file.as_ref().clone().into())?;
 
                         // Encrypted size should be the same as the decrypted
-                        // size, rounded up to a cipher
-                        // block.
+                        // size, rounded up to a cipher block.
                         let mut decrypted = Vec::with_capacity(content_len);
 
                         reader.read_to_end(&mut decrypted)?;
