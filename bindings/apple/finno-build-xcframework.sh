@@ -6,6 +6,7 @@
 #
 # Usage: bindings/apple/finno-build-xcframework.sh [extra cargo xtask args]
 set -euo pipefail
+shopt -s nullglob
 
 cd "$(dirname "$0")/../.."
 
