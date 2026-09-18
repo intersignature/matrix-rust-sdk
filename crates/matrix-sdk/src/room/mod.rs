@@ -387,12 +387,15 @@ macro_rules! make_media_type {
     }};
 }
 
-/// Process-wide set of `(room, event type)` pairs the homeserver has answered
-/// `M_NOT_FOUND` for during this run. Mirrors the negative cache of the
-/// Finnomena matrix-ios-sdk fork (`roomIdsWithCustomEventConfirmedAbsent`),
-/// keyed by event type as well so different types never mask each other.
-fn absent_room_account_data() -> &'static Mutex<BTreeSet<(OwnedRoomId, RoomAccountDataEventType)>> {
-    static CACHE: OnceLock<Mutex<BTreeSet<(OwnedRoomId, RoomAccountDataEventType)>>> =
+/// Process-wide set of `(user, room, event type)` triples the homeserver has
+/// answered `M_NOT_FOUND` for during this run. Mirrors the negative cache of
+/// the Finnomena matrix-ios-sdk fork (`roomIdsWithCustomEventConfirmedAbsent`),
+/// keyed by event type as well so different types never mask each other, and
+/// by user so a logout/login within the same process (as the nter iOS app
+/// does) never leaks one user's absence into another user's session.
+fn absent_room_account_data()
+-> &'static Mutex<BTreeSet<(OwnedUserId, OwnedRoomId, RoomAccountDataEventType)>> {
+    static CACHE: OnceLock<Mutex<BTreeSet<(OwnedUserId, OwnedRoomId, RoomAccountDataEventType)>>> =
         OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
@@ -1555,10 +1558,10 @@ impl Room {
     /// 2. Otherwise `GET /_matrix/client/v3/user/{userId}/rooms/{roomId}/account_data/{type}`
     ///    is sent; a successful response is persisted into the store (so
     ///    later [`Room::account_data`] reads see it) and returned.
-    /// 3. `M_NOT_FOUND` records `(room, type)` in a process-wide negative cache
-    ///    and returns `Ok(None)`; later calls return `Ok(None)` without a
-    ///    request. A value set afterwards still arrives through sync and is
-    ///    then served from the store by step 1.
+    /// 3. `M_NOT_FOUND` records `(user, room, type)` in a process-wide
+    ///    negative cache and returns `Ok(None)`; later calls return
+    ///    `Ok(None)` without a request. A value set afterwards still arrives
+    ///    through sync and is then served from the store by step 1.
     /// 4. Any other error is propagated.
     pub async fn account_data_or_fetch(
         &self,
@@ -1568,12 +1571,12 @@ impl Room {
             return Ok(Some(raw));
         }
 
-        let cache_key = (self.room_id().to_owned(), event_type.clone());
+        let own_user = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+        let cache_key = (own_user.to_owned(), self.room_id().to_owned(), event_type.clone());
         if absent_room_account_data().lock().unwrap().contains(&cache_key) {
             return Ok(None);
         }
 
-        let own_user = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
         let request = get_room_account_data::v3::Request::new(
             own_user.to_owned(),
             self.room_id().to_owned(),
@@ -6013,6 +6016,56 @@ mod tests {
         let result =
             room.account_data_or_fetch(RoomAccountDataEventType::from("com.finnomena.test")).await;
         assert!(result.is_err());
+
+        server.verify_and_reset().await;
+    }
+
+    #[async_test]
+    async fn test_account_data_or_fetch_when_one_type_absent_should_not_mask_other_types() {
+        const FINNO_ABSENT_TYPE_PATH: &str =
+            r"^/_matrix/client/v3/user/.*/rooms/.*/account_data/com\.finnomena\.absent$";
+        const FINNO_PRESENT_TYPE_PATH: &str =
+            r"^/_matrix/client/v3/user/.*/rooms/.*/account_data/com\.finnomena\.present$";
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!finno_two_types:localhost");
+        let room = server.sync_joined_room(&client, room_id).await;
+        let absent_type = RoomAccountDataEventType::from("com.finnomena.absent");
+        let present_type = RoomAccountDataEventType::from("com.finnomena.present");
+
+        Mock::given(method("GET"))
+            .and(path_regex(FINNO_ABSENT_TYPE_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "errcode": "M_NOT_FOUND",
+                "error": "Room account data not found",
+            })))
+            .expect(1)
+            .mount(server.server())
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(FINNO_PRESENT_TYPE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "name": "remote" })),
+            )
+            .expect(1)
+            .mount(server.server())
+            .await;
+
+        assert!(room.account_data_or_fetch(absent_type.clone()).await.unwrap().is_none());
+
+        let present = room
+            .account_data_or_fetch(present_type)
+            .await
+            .unwrap()
+            .expect("value fetched from the homeserver");
+        assert_eq!(content_name(&present), "remote");
+
+        // The absent type's negative cache entry must not have been masked by
+        // the present type's success (and vice versa): still answered from
+        // the negative cache, so the mock still expects exactly one request.
+        assert!(room.account_data_or_fetch(absent_type).await.unwrap().is_none());
 
         server.verify_and_reset().await;
     }
