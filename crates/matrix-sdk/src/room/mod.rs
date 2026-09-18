@@ -16,10 +16,10 @@
 
 use std::{
     borrow::Borrow,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     ops::Deref,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -47,7 +47,7 @@ use matrix_sdk_base::{
     },
     media::{MediaThumbnailSettings, store::IgnoreMediaRetentionPolicy},
     serde_helpers::extract_relation,
-    store::{StateStoreExt, ThreadSubscriptionStatus},
+    store::{StateChanges, StateStoreExt, ThreadSubscriptionStatus},
 };
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::{crypto::RoomEventDecryptionResult, deserialized_responses::EncryptionInfo};
@@ -75,7 +75,7 @@ use ruma::{
     OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
     api::{
         client::{
-            config::{set_global_account_data, set_room_account_data},
+            config::{get_room_account_data, set_global_account_data, set_room_account_data},
             context,
             filter::LazyLoadOptions,
             membership::{
@@ -385,6 +385,16 @@ macro_rules! make_media_type {
             }
         }
     }};
+}
+
+/// Process-wide set of `(room, event type)` pairs the homeserver has answered
+/// `M_NOT_FOUND` for during this run. Mirrors the negative cache of the
+/// Finnomena matrix-ios-sdk fork (`roomIdsWithCustomEventConfirmedAbsent`),
+/// keyed by event type as well so different types never mask each other.
+fn absent_room_account_data() -> &'static Mutex<BTreeSet<(OwnedRoomId, RoomAccountDataEventType)>> {
+    static CACHE: OnceLock<Mutex<BTreeSet<(OwnedRoomId, RoomAccountDataEventType)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(Default::default)
 }
 
 impl Room {
@@ -1536,6 +1546,64 @@ impl Room {
             .get_room_account_data_event(self.room_id(), data_type)
             .await
             .map_err(Into::into)
+    }
+
+    /// Read account data of the given type in this room, falling back to the
+    /// homeserver when the local store has no value.
+    ///
+    /// 1. A value in the store is returned without any network request.
+    /// 2. Otherwise `GET /_matrix/client/v3/user/{userId}/rooms/{roomId}/account_data/{type}`
+    ///    is sent; a successful response is persisted into the store (so
+    ///    later [`Room::account_data`] reads see it) and returned.
+    /// 3. `M_NOT_FOUND` records `(room, type)` in a process-wide negative cache
+    ///    and returns `Ok(None)`; later calls return `Ok(None)` without a
+    ///    request. A value set afterwards still arrives through sync and is
+    ///    then served from the store by step 1.
+    /// 4. Any other error is propagated.
+    pub async fn account_data_or_fetch(
+        &self,
+        event_type: RoomAccountDataEventType,
+    ) -> Result<Option<Raw<AnyRoomAccountDataEvent>>> {
+        if let Some(raw) = self.account_data(event_type.clone()).await? {
+            return Ok(Some(raw));
+        }
+
+        let cache_key = (self.room_id().to_owned(), event_type.clone());
+        if absent_room_account_data().lock().unwrap().contains(&cache_key) {
+            return Ok(None);
+        }
+
+        let own_user = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+        let request = get_room_account_data::v3::Request::new(
+            own_user.to_owned(),
+            self.room_id().to_owned(),
+            event_type.clone(),
+        );
+
+        match self.client.send(request).await {
+            Ok(response) => {
+                let raw_event: Raw<AnyRoomAccountDataEvent> = Raw::new(&serde_json::json!({
+                    "type": event_type.to_string(),
+                    "content": response.account_data,
+                }))?
+                .cast_unchecked();
+
+                let mut changes = StateChanges::default();
+                changes
+                    .room_account_data
+                    .entry(self.room_id().to_owned())
+                    .or_default()
+                    .insert(event_type, raw_event.clone());
+                self.client.state_store().save_changes(&changes).await?;
+
+                Ok(Some(raw_event))
+            }
+            Err(error) if error.client_api_error_kind() == Some(&ErrorKind::NotFound) => {
+                absent_room_account_data().lock().unwrap().insert(cache_key);
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Get account data of a statically-known type in this room, from storage.
@@ -4936,10 +5004,13 @@ mod tests {
     use ruma::{
         RoomVersionId, event_id,
         events::{
+            AnyRoomAccountDataEvent, RoomAccountDataEventType,
             relation::RelationType,
             room::{member::MembershipState, retention::RoomRetentionEventContent},
         },
-        owned_event_id, room_id, user_id,
+        owned_event_id, room_id,
+        serde::Raw,
+        user_id,
     };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -5813,5 +5884,136 @@ mod tests {
             assert_eq!(result.max_lifetime(), case.expected_max, "{}", case.description);
             assert_eq!(result.min_lifetime(), case.expected_min, "{}", case.description);
         }
+    }
+
+    fn finno_account_data_raw(name: &str) -> Raw<AnyRoomAccountDataEvent> {
+        Raw::new(&serde_json::json!({
+            "type": "com.finnomena.test",
+            "content": { "name": name },
+        }))
+        .unwrap()
+        .cast_unchecked()
+    }
+
+    fn content_name(raw: &Raw<AnyRoomAccountDataEvent>) -> String {
+        let value: serde_json::Value = serde_json::from_str(raw.json().get()).unwrap();
+        value["content"]["name"].as_str().unwrap().to_owned()
+    }
+
+    const FINNO_ACCOUNT_DATA_PATH: &str =
+        r"^/_matrix/client/v3/user/.*/rooms/.*/account_data/com\.finnomena\.test$";
+
+    #[async_test]
+    async fn test_account_data_or_fetch_when_present_locally_should_not_hit_network() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!finno_present:localhost");
+        let room = server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_account_data(finno_account_data_raw("local")),
+            )
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(FINNO_ACCOUNT_DATA_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "name": "remote" })),
+            )
+            .expect(0)
+            .mount(server.server())
+            .await;
+
+        let value = room
+            .account_data_or_fetch(RoomAccountDataEventType::from("com.finnomena.test"))
+            .await
+            .unwrap()
+            .expect("value from the local store");
+        assert_eq!(content_name(&value), "local");
+
+        server.verify_and_reset().await;
+    }
+
+    #[async_test]
+    async fn test_account_data_or_fetch_when_missing_locally_should_fetch_once_and_persist() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!finno_fetch:localhost");
+        let room = server.sync_joined_room(&client, room_id).await;
+        let event_type = RoomAccountDataEventType::from("com.finnomena.test");
+
+        Mock::given(method("GET"))
+            .and(path_regex(FINNO_ACCOUNT_DATA_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "name": "remote" })),
+            )
+            .expect(1)
+            .mount(server.server())
+            .await;
+
+        let first = room
+            .account_data_or_fetch(event_type.clone())
+            .await
+            .unwrap()
+            .expect("value fetched from the homeserver");
+        assert_eq!(content_name(&first), "remote");
+
+        // Persisted: a plain store read now sees it, and a second call must not
+        // hit the network (the mock expects exactly one request).
+        let stored = room.account_data(event_type.clone()).await.unwrap().expect("persisted");
+        assert_eq!(content_name(&stored), "remote");
+        let second = room.account_data_or_fetch(event_type).await.unwrap().expect("from store");
+        assert_eq!(content_name(&second), "remote");
+
+        server.verify_and_reset().await;
+    }
+
+    #[async_test]
+    async fn test_account_data_or_fetch_when_not_found_should_cache_absence() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!finno_absent:localhost");
+        let room = server.sync_joined_room(&client, room_id).await;
+        let event_type = RoomAccountDataEventType::from("com.finnomena.test");
+
+        Mock::given(method("GET"))
+            .and(path_regex(FINNO_ACCOUNT_DATA_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "errcode": "M_NOT_FOUND",
+                "error": "Room account data not found",
+            })))
+            .expect(1)
+            .mount(server.server())
+            .await;
+
+        assert!(room.account_data_or_fetch(event_type.clone()).await.unwrap().is_none());
+        // Second call is answered by the negative cache (mock expects one request).
+        assert!(room.account_data_or_fetch(event_type).await.unwrap().is_none());
+
+        server.verify_and_reset().await;
+    }
+
+    #[async_test]
+    async fn test_account_data_or_fetch_when_server_error_should_propagate() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!finno_error:localhost");
+        let room = server.sync_joined_room(&client, room_id).await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(FINNO_ACCOUNT_DATA_PATH))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "errcode": "M_UNKNOWN",
+                "error": "boom",
+            })))
+            .expect(1)
+            .mount(server.server())
+            .await;
+
+        let result =
+            room.account_data_or_fetch(RoomAccountDataEventType::from("com.finnomena.test")).await;
+        assert!(result.is_err());
+
+        server.verify_and_reset().await;
     }
 }

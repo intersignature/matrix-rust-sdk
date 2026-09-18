@@ -477,6 +477,19 @@ impl Room {
         raw.map(|raw| content_json(raw.json().get())).transpose()
     }
 
+    /// Same as [`Room::account_data`], but when the local store has no value
+    /// the type is fetched from the homeserver, persisted, and returned.
+    /// `M_NOT_FOUND` is remembered per `(room, type)` for the rest of the
+    /// process so the request is made at most once. See
+    /// `matrix_sdk::Room::account_data_or_fetch`.
+    pub async fn account_data_or_fetch(
+        &self,
+        event_type: String,
+    ) -> Result<Option<String>, ClientError> {
+        let raw = self.inner.account_data_or_fetch(event_type.into()).await?;
+        raw.map(|raw| content_json(raw.json().get())).transpose()
+    }
+
     /// Send a raw state event to the room.
     ///
     /// # Arguments
