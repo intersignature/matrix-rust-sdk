@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Finnomena fork: build MatrixSDKFFI.xcframework for device + simulator with
-# the nter deployment target (iOS 14.0), generate the Swift bindings into
+# the nter deployment target (iOS 14.0) — the simulator slice is universal
+# (arm64 + x86_64) because nter can build for the Rosetta simulator — generate
+# the Swift bindings into
 # bindings/apple/generated/ and refresh the root Package.swift used by nter's
 # SPM `path:` dependency.
 #
@@ -18,6 +20,7 @@ cargo xtask swift build-framework \
   --release \
   --target aarch64-apple-ios \
   --target aarch64-apple-ios-sim \
+  --target x86_64-apple-ios \
   --ios-deployment-target 14.0 \
   "$@"
 

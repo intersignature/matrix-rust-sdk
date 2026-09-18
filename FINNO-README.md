@@ -41,7 +41,7 @@ VoIP PRs (#1, #2, #5, #7) have no equivalent: the Rust SDK has no legacy `m.call
 
     bindings/apple/finno-build-xcframework.sh
 
-Produces `bindings/apple/generated/MatrixSDKFFI.xcframework` (ios-arm64 + ios-arm64-simulator, minos 14.0),
+Produces `bindings/apple/generated/MatrixSDKFFI.xcframework` (ios-arm64 + ios-arm64_x86_64-simulator, minos 14.0; the simulator slice is universal because nter can build for the Rosetta simulator),
 `bindings/apple/generated/swift/*.swift`, and copies `bindings/apple/Debug-Package.swift` to `./Package.swift`.
 nter references this checkout with an SPM `path:` dependency (see nter `NterApp/project.yml`).
 Both the root `Package.swift` and `bindings/apple/generated/` are generated and git-ignored: after a fresh clone, run the script once before nter's `xcodegen` can resolve the package.
