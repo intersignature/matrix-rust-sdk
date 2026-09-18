@@ -21,7 +21,7 @@ use matrix_sdk::{
     DraftAttachment as SdkDraftAttachment, DraftAttachmentContent, DraftThumbnail, EncryptionState,
     PredecessorRoom as SdkPredecessorRoom, RoomHeroWithProfile as SdkRoomHeroWithProfile,
     RoomMemberships, RoomState, SuccessorRoom as SdkSuccessorRoom,
-    deserialized_responses::TimelineEvent as SdkTimelineEvent,
+    deserialized_responses::{RawAnySyncOrStrippedState, TimelineEvent as SdkTimelineEvent},
     encryption::LocalTrust,
     room::{
         Room as SdkRoom, RoomMemberRole, edit::EditedContent, power_levels::RoomPowerLevelChanges,
@@ -488,6 +488,27 @@ impl Room {
     ) -> Result<Option<String>, ClientError> {
         let raw = self.inner.account_data_or_fetch(event_type.into()).await?;
         raw.map(|raw| content_json(raw.json().get())).transpose()
+    }
+
+    /// Get the `content` of the state event with the given type and state key
+    /// (e.g. `com.finnomena.oracle.better_together` / `""`) from the local
+    /// store, encoded as a JSON string. Works for joined rooms (sync state)
+    /// and invited rooms (stripped state).
+    pub async fn state_event(
+        &self,
+        event_type: String,
+        state_key: String,
+    ) -> Result<Option<String>, ClientError> {
+        let Some(raw) = self.inner.get_state_event(event_type.into(), &state_key).await? else {
+            return Ok(None);
+        };
+
+        let event_json = match raw {
+            RawAnySyncOrStrippedState::Sync(raw) => raw.json().get().to_owned(),
+            RawAnySyncOrStrippedState::Stripped(raw) => raw.json().get().to_owned(),
+        };
+
+        content_json(&event_json).map(Some)
     }
 
     /// Send a raw state event to the room.
