@@ -511,6 +511,19 @@ impl Room {
         content_json(&event_json).map(Some)
     }
 
+    /// Same as [`Room::state_event`], but fetches the state event from the
+    /// homeserver when the local store has no value (sliding sync does not
+    /// deliver custom state types), persisting it when the server returns the
+    /// full event. See `matrix_sdk::Room::state_event_or_fetch`.
+    pub async fn state_event_or_fetch(
+        &self,
+        event_type: String,
+        state_key: String,
+    ) -> Result<Option<String>, ClientError> {
+        let raw = self.inner.state_event_or_fetch(event_type.into(), &state_key).await?;
+        Ok(raw.map(|raw| raw.json().get().to_owned()))
+    }
+
     /// Send a raw state event to the room.
     ///
     /// # Arguments

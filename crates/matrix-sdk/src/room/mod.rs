@@ -62,8 +62,6 @@ use mime::Mime;
 use reply::Reply;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::AnySyncMessageLikeEvent;
-#[cfg(feature = "experimental-encrypted-state-events")]
-use ruma::events::AnySyncStateEvent;
 #[cfg(feature = "unstable-msc4274")]
 use ruma::events::room::message::GalleryItemType;
 #[cfg(feature = "e2e-encryption")]
@@ -92,7 +90,10 @@ use ruma::{
             redact::redact_event,
             retention::get_retention_configuration,
             room::{get_room_event, report_content, report_room},
-            state::{get_state_event_for_key, send_state_event},
+            state::{
+                get_state_event_for_key::{self, v3::StateEventFormat},
+                send_state_event,
+            },
             tag::{create_tag, delete_tag},
             threads::{get_thread_subscription, subscribe_thread, unsubscribe_thread},
             typing::create_typing_event::{
@@ -104,11 +105,11 @@ use ruma::{
     },
     assign,
     events::{
-        AnyRoomAccountDataEvent, AnyRoomAccountDataEventContent, AnyTimelineEvent, EmptyStateKey,
-        Mentions, MessageLikeEventContent, OriginalSyncStateEvent, RedactContent,
-        RedactedStateEventContent, RoomAccountDataEvent, RoomAccountDataEventContent,
-        RoomAccountDataEventType, StateEventContent, StateEventType, StaticEventContent,
-        StaticStateEventContent, SyncStateEvent,
+        AnyRoomAccountDataEvent, AnyRoomAccountDataEventContent, AnyStateEventContent,
+        AnySyncStateEvent, AnyTimelineEvent, EmptyStateKey, Mentions, MessageLikeEventContent,
+        OriginalSyncStateEvent, RedactContent, RedactedStateEventContent, RoomAccountDataEvent,
+        RoomAccountDataEventContent, RoomAccountDataEventType, StateEventContent, StateEventType,
+        StaticEventContent, StaticStateEventContent, SyncStateEvent,
         beacon::BeaconEventContent,
         beacon_info::BeaconInfoEventContent,
         direct::DirectEventContent,
@@ -152,6 +153,7 @@ use ruma::{
     serde::JsonCastable,
 };
 use serde::de::DeserializeOwned;
+use serde_json::value::RawValue as RawJsonValue;
 use thiserror::Error;
 use tokio::{join, sync::broadcast};
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -398,6 +400,17 @@ fn absent_room_account_data()
     static CACHE: OnceLock<Mutex<BTreeSet<(OwnedUserId, OwnedRoomId, RoomAccountDataEventType)>>> =
         OnceLock::new();
     CACHE.get_or_init(Default::default)
+}
+
+/// Extracts the `content` object of a full state event JSON document as a
+/// raw content value. A missing `content` yields `{}`.
+fn state_event_content(event_json: &RawJsonValue) -> Result<Raw<AnyStateEventContent>> {
+    let value: serde_json::Value = serde_json::from_str(event_json.get())?;
+    let content = value
+        .get("content")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    Ok(Raw::new(&content)?.cast_unchecked())
 }
 
 impl Room {
@@ -1563,6 +1576,10 @@ impl Room {
     ///    `Ok(None)` without a request. A value set afterwards still arrives
     ///    through sync and is then served from the store by step 1.
     /// 4. Any other error is propagated.
+    ///
+    /// The store write bypasses the base client, so `RoomInfo` and account
+    /// data event handlers are not updated: use this for custom account data
+    /// types only, never for `m.tag`, `m.fully_read` or marked-unread.
     pub async fn account_data_or_fetch(
         &self,
         event_type: RoomAccountDataEventType,
@@ -1605,6 +1622,77 @@ impl Room {
                 absent_room_account_data().lock().unwrap().insert(cache_key);
                 Ok(None)
             }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Read the state event with the given type and state key from the local
+    /// store, falling back to the homeserver when the store has no value.
+    ///
+    /// Sliding sync only delivers the well-known `m.*` state types listed in
+    /// its `required_state`, so custom state (e.g. `com.finnomena.oracle.*`)
+    /// never reaches the store through sync. This method:
+    ///
+    /// 1. returns the `content` of the stored event when present, without
+    ///    any request;
+    /// 2. otherwise sends
+    ///    `GET /_matrix/client/v3/rooms/{roomId}/state/{type}/{key}?format=event`.
+    ///    When the homeserver honours `format=event` (Synapse does) the full
+    ///    event is persisted into the state store so later reads are local;
+    ///    when it answers with bare content, the content is returned without
+    ///    persisting;
+    /// 3. `M_NOT_FOUND` yields `Ok(None)` (no negative cache: callers read
+    ///    state once per screen, and a value created later must be found);
+    /// 4. any other error is propagated.
+    ///
+    /// The persisted event bypasses the base client, so `RoomInfo` and state
+    /// event handlers are not updated: use this for custom state types only,
+    /// never for `m.room.*` state.
+    pub async fn state_event_or_fetch(
+        &self,
+        event_type: StateEventType,
+        state_key: &str,
+    ) -> Result<Option<Raw<AnyStateEventContent>>> {
+        if let Some(raw) = self.get_state_event(event_type.clone(), state_key).await? {
+            let event_json = match raw {
+                RawAnySyncOrStrippedState::Sync(raw) => raw.into_json(),
+                RawAnySyncOrStrippedState::Stripped(raw) => raw.into_json(),
+            };
+            return Ok(Some(state_event_content(&event_json)?));
+        }
+
+        let mut request = get_state_event_for_key::v3::Request::new(
+            self.room_id().to_owned(),
+            event_type.clone(),
+            state_key.to_owned(),
+        );
+        request.format = StateEventFormat::Event;
+
+        match self.client.send(request).await {
+            Ok(response) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(response.event_or_content.get())?;
+                let is_full_event = value.get("type").is_some() && value.get("content").is_some();
+
+                if is_full_event {
+                    let raw_event: Raw<AnySyncStateEvent> =
+                        Raw::from_json(response.event_or_content);
+                    let mut changes = StateChanges::default();
+                    changes
+                        .state
+                        .entry(self.room_id().to_owned())
+                        .or_default()
+                        .entry(event_type)
+                        .or_default()
+                        .insert(state_key.to_owned(), raw_event.clone());
+                    self.client.state_store().save_changes(&changes).await?;
+
+                    Ok(Some(state_event_content(raw_event.json())?))
+                } else {
+                    Ok(Some(Raw::<AnyStateEventContent>::from_json(response.event_or_content)))
+                }
+            }
+            Err(error) if error.client_api_error_kind() == Some(&ErrorKind::NotFound) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
@@ -5007,7 +5095,8 @@ mod tests {
     use ruma::{
         RoomVersionId, event_id,
         events::{
-            AnyRoomAccountDataEvent, RoomAccountDataEventType,
+            AnyRoomAccountDataEvent, AnyStateEventContent, AnySyncStateEvent,
+            RoomAccountDataEventType, StateEventType,
             relation::RelationType,
             room::{member::MembershipState, retention::RoomRetentionEventContent},
         },
@@ -5017,7 +5106,7 @@ mod tests {
     };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{header, method, path, path_regex},
+        matchers::{header, method, path, path_regex, query_param},
     };
 
     use crate::{
@@ -5889,6 +5978,7 @@ mod tests {
         }
     }
 
+    // The negative cache is process-wide: every test below uses its own room id.
     fn finno_account_data_raw(name: &str) -> Raw<AnyRoomAccountDataEvent> {
         Raw::new(&serde_json::json!({
             "type": "com.finnomena.test",
@@ -6066,6 +6156,181 @@ mod tests {
         // the present type's success (and vice versa): still answered from
         // the negative cache, so the mock still expects exactly one request.
         assert!(room.account_data_or_fetch(absent_type).await.unwrap().is_none());
+
+        server.verify_and_reset().await;
+    }
+
+    const FINNO_STATE_PATH: &str =
+        r"^/_matrix/client/v3/rooms/[^/]+/state/com\.finnomena\.test_state/?$";
+
+    fn finno_state_event_json(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "com.finnomena.test_state",
+            "state_key": "",
+            "sender": "@example:localhost",
+            "event_id": "$finno_state_event",
+            "origin_server_ts": 1_700_000_000_000u64,
+            "content": { "name": name },
+        })
+    }
+
+    fn state_content_name(raw: &Raw<AnyStateEventContent>) -> String {
+        let value: serde_json::Value = serde_json::from_str(raw.json().get()).unwrap();
+        value["name"].as_str().unwrap().to_owned()
+    }
+
+    #[async_test]
+    async fn test_state_event_or_fetch_when_present_locally_should_not_hit_network() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!finno_state_present:localhost");
+        let event_type = StateEventType::from("com.finnomena.test_state");
+        let room = server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_state_event(
+                    Raw::new(&finno_state_event_json("local"))
+                        .unwrap()
+                        .cast_unchecked::<AnySyncStateEvent>(),
+                ),
+            )
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(FINNO_STATE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(finno_state_event_json("remote")),
+            )
+            .expect(0)
+            .mount(server.server())
+            .await;
+
+        let value = room
+            .state_event_or_fetch(event_type, "")
+            .await
+            .unwrap()
+            .expect("value from the local store");
+        assert_eq!(state_content_name(&value), "local");
+
+        server.verify_and_reset().await;
+    }
+
+    #[async_test]
+    async fn test_state_event_or_fetch_when_missing_should_fetch_full_event_and_persist() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!finno_state_event:localhost");
+        let room = server.sync_joined_room(&client, room_id).await;
+        let event_type = StateEventType::from("com.finnomena.test_state");
+
+        Mock::given(method("GET"))
+            .and(path_regex(FINNO_STATE_PATH))
+            .and(query_param("format", "event"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(finno_state_event_json("remote")),
+            )
+            .expect(1)
+            .mount(server.server())
+            .await;
+
+        let first = room
+            .state_event_or_fetch(event_type.clone(), "")
+            .await
+            .unwrap()
+            .expect("value fetched from the homeserver");
+        assert_eq!(state_content_name(&first), "remote");
+
+        // Persisted: a plain store read now sees it, and a second call must not
+        // hit the network (the mock expects exactly one request).
+        assert!(room.get_state_event(event_type.clone(), "").await.unwrap().is_some());
+        let second = room.state_event_or_fetch(event_type, "").await.unwrap().expect("from store");
+        assert_eq!(state_content_name(&second), "remote");
+
+        server.verify_and_reset().await;
+    }
+
+    #[async_test]
+    async fn test_state_event_or_fetch_when_server_returns_content_only_should_not_persist() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!finno_state_content:localhost");
+        let room = server.sync_joined_room(&client, room_id).await;
+        let event_type = StateEventType::from("com.finnomena.test_state");
+
+        Mock::given(method("GET"))
+            .and(path_regex(FINNO_STATE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "name": "remote" })),
+            )
+            .expect(2)
+            .mount(server.server())
+            .await;
+
+        let first = room
+            .state_event_or_fetch(event_type.clone(), "")
+            .await
+            .unwrap()
+            .expect("value fetched from the homeserver");
+        assert_eq!(state_content_name(&first), "remote");
+
+        let second = room
+            .state_event_or_fetch(event_type.clone(), "")
+            .await
+            .unwrap()
+            .expect("value fetched from the homeserver");
+        assert_eq!(state_content_name(&second), "remote");
+
+        // Bare content responses are never persisted, so each call hits the
+        // network (the mock expects exactly two requests) and the store stays
+        // empty.
+        assert!(room.get_state_event(event_type, "").await.unwrap().is_none());
+
+        server.verify_and_reset().await;
+    }
+
+    #[async_test]
+    async fn test_state_event_or_fetch_when_not_found_should_return_none() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!finno_state_absent:localhost");
+        let room = server.sync_joined_room(&client, room_id).await;
+        let event_type = StateEventType::from("com.finnomena.test_state");
+
+        Mock::given(method("GET"))
+            .and(path_regex(FINNO_STATE_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "errcode": "M_NOT_FOUND",
+                "error": "not found",
+            })))
+            .expect(1)
+            .mount(server.server())
+            .await;
+
+        assert!(room.state_event_or_fetch(event_type, "").await.unwrap().is_none());
+
+        server.verify_and_reset().await;
+    }
+
+    #[async_test]
+    async fn test_state_event_or_fetch_when_server_error_should_propagate() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!finno_state_error:localhost");
+        let room = server.sync_joined_room(&client, room_id).await;
+        let event_type = StateEventType::from("com.finnomena.test_state");
+
+        Mock::given(method("GET"))
+            .and(path_regex(FINNO_STATE_PATH))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "errcode": "M_UNKNOWN",
+                "error": "boom",
+            })))
+            .expect(1)
+            .mount(server.server())
+            .await;
+
+        let result = room.state_event_or_fetch(event_type, "").await;
+        assert!(result.is_err());
 
         server.verify_and_reset().await;
     }
