@@ -468,6 +468,15 @@ impl Room {
         Ok(())
     }
 
+    /// Get the `content` of a room account data event of the given type
+    /// (e.g. `com.finnomena.oracle.room_name`) from the local store, encoded
+    /// as a JSON string. The store is populated by sync; use
+    /// [`Room::account_data_or_fetch`] to fall back to the homeserver.
+    pub async fn account_data(&self, event_type: String) -> Result<Option<String>, ClientError> {
+        let raw = self.inner.account_data(event_type.into()).await?;
+        raw.map(|raw| content_json(raw.json().get())).transpose()
+    }
+
     /// Send a raw state event to the room.
     ///
     /// # Arguments
@@ -2132,6 +2141,24 @@ impl TryFrom<SdkRoomSendQueueUpdate> for RoomSendQueueUpdate {
             }
         })
     }
+}
+
+/// Extracts the `content` object of a full event JSON document and returns it
+/// re-encoded as a JSON string. Missing `content` yields `{}` so callers can
+/// always parse the result as an object.
+fn content_json(event_json: &str) -> Result<String, ClientError> {
+    let value: serde_json::Value =
+        serde_json::from_str(event_json).map_err(|e| ClientError::Generic {
+            msg: format!("Failed to parse event JSON: {e}"),
+            details: Some(format!("{e:?}")),
+        })?;
+
+    let content = value
+        .get("content")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+
+    Ok(content.to_string())
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
