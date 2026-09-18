@@ -616,6 +616,32 @@ impl Client {
         Ok(())
     }
 
+    /// Login using the `m.login.token` flow with a token obtained
+    /// out-of-band (for Finnomena: the `loginToken` handed to the app by the
+    /// web login redirect).
+    ///
+    /// Mirrors [`Client::login`] for everything but the credential.
+    pub async fn login_with_token(
+        &self,
+        token: String,
+        initial_device_name: Option<String>,
+        device_id: Option<String>,
+    ) -> Result<(), ClientError> {
+        let mut builder = self.inner.matrix_auth().login_token(&token);
+
+        if let Some(initial_device_name) = initial_device_name.as_ref() {
+            builder = builder.initial_device_display_name(initial_device_name);
+        }
+
+        if let Some(device_id) = device_id.as_ref() {
+            builder = builder.device_id(device_id);
+        }
+
+        builder.send().await?;
+
+        Ok(())
+    }
+
     /// Login using JWT
     /// This is an implementation of the custom_login https://docs.rs/matrix-sdk/latest/matrix_sdk/matrix_auth/struct.MatrixAuth.html#method.login_custom
     /// For more information on logging in with JWT: https://element-hq.github.io/synapse/latest/jwt.html
