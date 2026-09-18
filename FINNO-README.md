@@ -27,8 +27,8 @@ VoIP PRs (#1, #2, #5, #7) have no equivalent: the Rust SDK has no legacy `m.call
 ## API notes for the app
 
 - `Room.accountData`, `Room.accountDataOrFetch`, `Room.stateEvent` and `Room.stateEventOrFetch` return the
-  event **`content`** object as a JSON string. Upstream `Client.accountData(eventType:)` returns the **whole
-  event** JSON (`{"type": ..., "content": ...}`) — same selector name, different payload.
+  event **`content`** object as a JSON string — the same convention as upstream `Client.accountData(eventType:)`
+  (verified in core: `Account::account_data_raw` → `get_raw_content`).
 - `Room.accountDataOrFetch` issues at most one `GET` per (user, room, type) per process; after `M_NOT_FOUND`
   it answers `nil` without a request until the app restarts. A value created server-side later still
   arrives through sync (room account data is synced for all types).
